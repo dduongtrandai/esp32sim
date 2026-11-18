@@ -4,8 +4,12 @@
 //! {"kind":"led","pins":{"signal":2}}, …]}`. Parts are numbered by their place in the list; that
 //! number is the `id` the page's controls use.
 //!
-//! - `ssd1306`: the OLED controller on I2C0 at `addr` (0x3C by default). The first one is the
-//!   board's display (`{"t":…}` binary type 1).
+//! - `ssd1306`: the OLED controller on I2C0 at `addr` (0x3C by default).
+//! - `st7789` / `ili9341`: an SPI TFT on `sck`, `mosi`, `dc`, and `cs` and `rst` when wired, `width` x `height`
+//!   of its 240 x 320 RAM, 240 x 320 by default (240 x 240 for the 1.3" and 1.54" ST7789 modules).
+//!   The first OLED or TFT in the list is the board's display (binary message type 1).
+//! - `ws2812`: a chain of `count` LEDs on `data`, fed by RMT frames or decoded from GPIO pulses;
+//!   reported with each LED's colour.
 //! - `dht22` / `dht11`: the sensor on `data`; the page sets `temperature` and `humidity`.
 //! - `led`, `buzzer`: outputs on `signal`, reported with their level and any PWM on the pin.
 //!   A buzzer toggled by software reports the frequency of its edges.
@@ -15,18 +19,96 @@ use std::sync::{Arc, Mutex};
 
 use esp_periph::i2c::I2cDevice;
 
-use crate::board::{BoardEdge, BoardModel, VirtualCycle};
-use crate::devices::{Dht, DhtKind, Ssd1306, Ssd1306I2c};
+use crate::board::{BoardEdge, BoardModel, SpiPins, VirtualCycle};
+use crate::devices::{DcsPanel, Dht, DhtKind, Ssd1306, Ssd1306I2c, Ws2812Chain};
 use crate::json::{parse_json, Json};
+
+/// An SPI TFT module: an ST77xx/ILI9341 controller (`DcsPanel`) behind its glass. The RAM is
+/// 240 x 320; the glass shows the first `width` columns and `height` rows of it. The glass decides
+/// how the controller's RAM looks:
+/// - its scan direction: an ST7789 module scans RAM mirrored in both axes and an ILI9341 module
+///   in x, which is why their drivers draw rotation 0 with MADCTL MX|MY and MX (Adafruit_ST7789,
+///   Adafruit_ILI9341) and the picture comes out upright;
+/// - its colour order: an ILI9341 module is BGR, an ST7789 one RGB;
+/// - whether it is an IPS panel that shows inverted RAM unless the firmware sends INVON (ST7789
+///   modules are, which is why their drivers send it).
+struct Tft {
+    kind: &'static str,
+    panel: DcsPanel,
+    sck: u8,
+    mosi: u8,
+    /// None: CS tied low on the module (many 240 x 240 ST7789 boards have no CS pin).
+    cs: Option<u8>,
+    dc: u8,
+    rst: Option<u8>,
+    cs_high: bool,
+    width: usize,
+    height: usize,
+    flip_x: bool,
+    flip_y: bool,
+    bgr_glass: bool,
+    inverted_glass: bool,
+}
+
+impl Tft {
+    fn new(kind: &'static str, p: &Json) -> Option<Self> {
+        let (sck, mosi, cs, dc) = (pin(p, "sck")?, pin(p, "mosi")?, pin(p, "cs"), pin(p, "dc")?);
+        let st7789 = kind == "st7789";
+        let width = (p.i64_or("width", 240).clamp(16, 240)) as usize;
+        let height = (p.i64_or("height", 320).clamp(16, 320)) as usize;
+        Some(Tft {
+            kind,
+            panel: if st7789 { DcsPanel::st7789() } else { DcsPanel::new(240, 320) },
+            sck, mosi, cs, dc, rst: pin(p, "rst"),
+            cs_high: cs.is_some(),
+            width, height,
+            flip_x: true,
+            flip_y: st7789,
+            bgr_glass: !st7789,
+            inverted_glass: st7789,
+        })
+    }
+    fn on_wires(&self, pins: &SpiPins) -> bool {
+        let routed = pins.sclk != 0 || pins.mosi != 0;
+        !routed || (pins.sclk >> self.sck & 1 == 1 && pins.mosi >> self.mosi & 1 == 1)
+    }
+    fn lit(&self) -> bool { self.panel.on && !self.panel.sleeping }
+    fn version(&self) -> u64 { self.panel.pixels_written + self.panel.frames + self.panel.resets * 7 + self.lit() as u64 }
+    /// What the glass shows, RGB565, row by row.
+    fn frame(&self) -> Vec<u16> {
+        let p = &self.panel;
+        let swap = (p.madctl & 0x08 != 0) != self.bgr_glass;
+        let invert = p.inverted != self.inverted_glass;
+        let lit = self.lit();
+        let mut out = Vec::with_capacity(self.width * self.height);
+        for y in 0..self.height {
+            let ry = if self.flip_y { self.height - 1 - y } else { y };
+            let row = ry.min(p.rows - 1) * p.cols;
+            for x in 0..self.width {
+                let rx = if self.flip_x { self.width - 1 - x } else { x };
+                let mut px = p.gram[row + rx.min(p.cols - 1)];
+                if swap { px = (px & 0x07e0) | ((px & 0xf800) >> 11) | ((px & 0x001f) << 11); }
+                if invert { px = !px; }
+                out.push(if lit { px } else { 0 });
+            }
+        }
+        out
+    }
+}
 
 enum Part {
     Oled { addr: u8, state: Arc<Mutex<Ssd1306>> },
+    Tft(Box<Tft>),
+    Strip { pin: u8, chain: Ws2812Chain },
     Dht(Dht),
     Led { pin: u8 },
     Buzzer { pin: u8, rises: [VirtualCycle; 2] },
     Button { pin: u8 },
     Analog { pin: u8 },
 }
+
+/// The most LEDs a strip part may have.
+const MAX_STRIP: usize = 300;
 
 pub struct VibeBoard {
     parts: Vec<(String, Part)>,
@@ -58,6 +140,12 @@ impl VibeBoard {
                     let height = p.i64_or("height", 64) as usize;
                     Some(Part::Oled { addr, state: Arc::new(Mutex::new(Ssd1306::new(height))) })
                 }
+                "st7789" => Tft::new("st7789", p).map(|t| Part::Tft(Box::new(t))),
+                "ili9341" => Tft::new("ili9341", p).map(|t| Part::Tft(Box::new(t))),
+                "ws2812" => pin(p, "data").map(|pin| {
+                    let n = p.i64_or("count", 8).clamp(1, MAX_STRIP as i64) as usize;
+                    Part::Strip { pin, chain: Ws2812Chain::new(n).with_gpio_clock(cycle_hz as u32) }
+                }),
                 "dht22" | "dht11" => pin(p, "data").map(|pin| {
                     let mut d = Dht::new(pin, if kind == "dht11" { DhtKind::Dht11 } else { DhtKind::Dht22 }, us);
                     if let Some(t) = p.get("temperature").and_then(Json::as_f64) { d.temperature = t; }
@@ -75,8 +163,17 @@ impl VibeBoard {
         Ok(Self { parts, levels: 0, now: 0, gpio_events: 0, cycle_hz })
     }
 
-    fn oled(&self) -> Option<&Arc<Mutex<Ssd1306>>> {
-        self.parts.iter().find_map(|(_, p)| match p { Part::Oled { state, .. } => Some(state), _ => None })
+    /// The board's display: its first OLED or TFT, in the design's order.
+    fn screen(&self) -> Option<&Part> {
+        self.parts.iter().map(|(_, p)| p).find(|p| matches!(p, Part::Oled { .. } | Part::Tft(_)))
+    }
+
+    fn tfts(&mut self) -> impl Iterator<Item = &mut Tft> {
+        self.parts.iter_mut().filter_map(|(_, p)| match p { Part::Tft(t) => Some(&mut **t), _ => None })
+    }
+
+    fn strips(&mut self) -> impl Iterator<Item = (u8, &mut Ws2812Chain)> {
+        self.parts.iter_mut().filter_map(|(_, p)| match p { Part::Strip { pin, chain } => Some((*pin, chain)), _ => None })
     }
 
     fn dhts(&mut self) -> impl Iterator<Item = &mut Dht> {
@@ -102,9 +199,39 @@ impl BoardModel for VibeBoard {
             }
         }
         for d in self.dhts() { d.host_drive(cycle, enabled, output); }
+        for t in self.tfts() {
+            for &(pin, level) in changes {
+                if Some(pin) == t.cs { t.cs_high = level; }
+                if pin == t.dc { t.panel.dc = level; }
+                if Some(pin) == t.rst && !level { t.panel.reset(); }
+            }
+        }
+        // a strip driven by bit-banging rather than RMT: decode its pulses
+        for (pin, chain) in self.strips() {
+            if changes.iter().any(|&(p, _)| p == pin) {
+                chain.gpio_drive(cycle, enabled >> pin & 1 == 1, output >> pin & 1 == 1);
+            }
+        }
     }
 
     fn gpio_events(&self) -> u64 { self.gpio_events }
+
+    fn rmt_frame(&mut self, pin: u8, bits: &[bool]) {
+        for (p, chain) in self.strips() {
+            if p == pin { chain.from_bits(bits); }
+        }
+    }
+
+    fn uses_spi_pins(&self) -> bool { self.parts.iter().any(|(_, p)| matches!(p, Part::Tft(_))) }
+
+    fn spi_transfer_pins(&mut self, _host: u8, pins: SpiPins, tx: &[u8], rx_len: usize) -> Vec<u8> {
+        for t in self.tfts() {
+            if !t.cs_high && t.on_wires(&pins) {
+                for &b in tx { t.panel.byte(b); }
+            }
+        }
+        vec![0xff; rx_len] // no MISO on these modules
+    }
 
     fn i2c_devices(&mut self) -> Vec<(u8, u8, Box<dyn I2cDevice>)> {
         self.parts.iter().filter_map(|(_, p)| match p {
@@ -114,11 +241,26 @@ impl BoardModel for VibeBoard {
     }
 
     fn display(&self) -> Option<(u32, u32, Vec<u16>, u64)> {
-        let s = self.oled()?.lock().expect("SSD1306 mutex poisoned");
-        Some((crate::devices::ssd1306::SSD1306_WIDTH as u32, s.height() as u32, s.frame(), s.version))
+        match self.screen()? {
+            Part::Oled { state, .. } => {
+                let s = state.lock().expect("SSD1306 mutex poisoned");
+                Some((crate::devices::ssd1306::SSD1306_WIDTH as u32, s.height() as u32, s.frame(), s.version))
+            }
+            Part::Tft(t) => Some((t.width as u32, t.height as u32, t.frame(), t.version())),
+            _ => None,
+        }
     }
-    fn display_version(&self) -> u64 { self.oled().map_or(0, |s| s.lock().expect("SSD1306 mutex poisoned").version) }
+    fn display_version(&self) -> u64 {
+        match self.screen() {
+            Some(Part::Oled { state, .. }) => state.lock().expect("SSD1306 mutex poisoned").version,
+            Some(Part::Tft(t)) => t.version(),
+            _ => 0,
+        }
+    }
     fn display_frames(&self) -> u64 { self.display_version() }
+    /// A TFT frame is 150 KB: push it once drawing settles rather than mid-frame, as esp32sim does
+    /// for the other pixel-streaming panels.
+    fn display_quiet_push(&self) -> bool { matches!(self.screen(), Some(Part::Tft(_))) }
 
     /// Buttons idle high (pressed pulls them low); the DHT line idles high on its pull-up.
     fn input_levels(&self) -> Vec<(u8, bool)> {
@@ -130,12 +272,17 @@ impl BoardModel for VibeBoard {
     }
 
     fn next_deadline(&self) -> Option<VirtualCycle> {
-        self.parts.iter().filter_map(|(_, p)| match p { Part::Dht(d) => d.next_deadline(), _ => None }).min()
+        self.parts.iter().filter_map(|(_, p)| match p {
+            Part::Dht(d) => d.next_deadline(),
+            Part::Strip { chain, .. } => chain.gpio_deadline(),
+            _ => None,
+        }).min()
     }
 
     fn advance_to(&mut self, cycle: VirtualCycle) {
         self.now = self.now.max(cycle);
         for d in self.dhts() { d.advance_to(cycle); }
+        for (_, chain) in self.strips() { chain.advance_gpio(cycle); }
     }
 
     fn take_edges(&mut self) -> Vec<BoardEdge> {
@@ -151,7 +298,8 @@ impl BoardModel for VibeBoard {
         self.parts.iter().find(|(id, _)| id.parse() == Ok(i)).and_then(|(_, p)| match p {
             Part::Button { pin } | Part::Led { pin } | Part::Buzzer { pin, .. } | Part::Analog { pin } => Some(*pin),
             Part::Dht(d) => Some(d.pin),
-            Part::Oled { .. } => None,
+            Part::Strip { pin, .. } => Some(*pin),
+            Part::Oled { .. } | Part::Tft(_) => None,
         })
     }
 
@@ -168,6 +316,13 @@ impl BoardModel for VibeBoard {
                 Part::Oled { addr, state } => {
                     let s = state.lock().expect("SSD1306 mutex poisoned");
                     format!("{{\"id\":\"{id}\",\"kind\":\"ssd1306\",\"addr\":{addr},\"on\":{},\"height\":{}}}", s.is_on(), s.height())
+                }
+                Part::Tft(t) => format!(
+                    "{{\"id\":\"{id}\",\"kind\":\"{}\",\"on\":{},\"width\":{},\"height\":{},\"frames\":{}}}",
+                    t.kind, t.lit(), t.width, t.height, t.panel.frames),
+                Part::Strip { pin, chain } => {
+                    let leds: Vec<String> = chain.leds.iter().map(|c| format!("[{},{},{}]", c[0], c[1], c[2])).collect();
+                    format!("{{\"id\":\"{id}\",\"kind\":\"ws2812\",\"pin\":{pin},\"updates\":{},\"leds\":[{}]}}", chain.updates, leds.join(","))
                 }
                 Part::Dht(d) => format!(
                     "{{\"id\":\"{id}\",\"kind\":\"{}\",\"pin\":{},\"temperature\":{:.1},\"humidity\":{:.1},\"reads\":{}}}",
@@ -268,5 +423,73 @@ mod tests {
     #[test]
     fn bad_json_is_an_error() {
         assert!(VibeBoard::from_config("{parts", HZ).is_err());
+    }
+
+    const TFT: &str = r#"{"parts":[
+        {"kind":"st7789","label":"TFT","pins":{"sck":12,"mosi":11,"cs":10,"dc":9,"rst":8},"width":240,"height":320},
+        {"kind":"ws2812","label":"Strip","pins":{"data":5},"count":3},
+        {"kind":"st7789","label":"no pins","pins":{"sck":12}}
+    ]}"#;
+
+    fn routes() -> SpiPins { SpiPins { sclk: 1 << 12, mosi: 1 << 11, miso: None, cs: 0 } }
+
+    /// One command and its parameters, with CS and D/C driven as a GPIO-CS driver does.
+    fn cmd(b: &mut VibeBoard, c: u8, params: &[u8]) {
+        b.gpio_output_at(0, &[(10, false), (9, false)], 0, 0);
+        b.spi_transfer_pins(2, routes(), &[c], 0);
+        if !params.is_empty() {
+            b.gpio_output_at(0, &[(9, true)], 0, 0);
+            b.spi_transfer_pins(2, routes(), params, 0);
+        }
+        b.gpio_output_at(0, &[(10, true)], 0, 0);
+    }
+
+    #[test]
+    fn an_st7789_draws_on_its_glass_as_the_adafruit_driver_leaves_it() {
+        let mut b = VibeBoard::from_config(TFT, HZ).unwrap();
+        assert_eq!(b.parts.len(), 2, "the TFT without its SPI pins is skipped");
+        assert!(b.uses_spi_pins());
+        assert!(b.display_quiet_push());
+        // Adafruit_ST7789: SWRESET, SLPOUT, COLMOD 16-bit, rotation 0 = MADCTL MX|MY|RGB, INVON, DISPON
+        for (c, p) in [(0x01, &[][..]), (0x11, &[]), (0x3a, &[0x55]), (0x36, &[0xc0]), (0x21, &[]), (0x29, &[])] { cmd(&mut b, c, p); }
+        // a red pixel at (2, 1), and another write while CS is high that must not land; the glass
+        // scans RAM mirrored both ways, so the pixel the driver mirrored comes out where it was drawn
+        cmd(&mut b, 0x2a, &[0, 2, 0, 2]);
+        cmd(&mut b, 0x2b, &[0, 1, 0, 1]);
+        cmd(&mut b, 0x2c, &[0xf8, 0x00]);
+        b.spi_transfer_pins(2, routes(), &[0x2c, 0x07, 0xe0], 0);
+        let (w, h, px, _) = b.display().unwrap();
+        assert_eq!((w, h), (240, 320));
+        assert_eq!(px[240 + 2], 0xf800, "INVON on an IPS glass shows the RAM as written");
+        assert_eq!(px.iter().filter(|&&p| p != 0).count(), 1);
+        let s = b.ui_state(&[]).unwrap();
+        assert!(s.contains(r#""kind":"st7789","on":true,"width":240,"height":320"#), "{s}");
+        // without INVON the IPS glass shows inverted RAM
+        cmd(&mut b, 0x20, &[]);
+        assert_eq!(b.display().unwrap().2[240 + 2], !0xf800);
+    }
+
+    #[test]
+    fn an_ili9341_glass_is_bgr() {
+        let cfg = r#"{"parts":[{"kind":"ili9341","pins":{"sck":12,"mosi":11,"cs":10,"dc":9}}]}"#;
+        let mut b = VibeBoard::from_config(cfg, HZ).unwrap();
+        for (c, p) in [(0x11, &[][..]), (0x3a, &[0x55]), (0x36, &[0x48]), (0x29, &[])] { cmd(&mut b, c, p); }
+        cmd(&mut b, 0x2a, &[0, 0, 0, 0]);
+        cmd(&mut b, 0x2b, &[0, 0, 0, 0]);
+        cmd(&mut b, 0x2c, &[0xf8, 0x00]);
+        // MADCTL 0x48 (MX | BGR) is how Adafruit_ILI9341 drives its BGR glass, mirrored in x:
+        // the pixel drawn at (0, 0) shows at (0, 0), and red stays red
+        assert_eq!(b.display().unwrap().2[0], 0xf800);
+    }
+
+    #[test]
+    fn a_strip_takes_rmt_frames_and_reports_its_colours() {
+        let mut b = VibeBoard::from_config(TFT, HZ).unwrap();
+        let grb = |g: u8, r: u8, bl: u8| [g, r, bl].into_iter().flat_map(|v| (0..8).map(move |i| v & (0x80 >> i) != 0)).collect::<Vec<bool>>();
+        let frame: Vec<bool> = [grb(0, 255, 0), grb(255, 0, 0), grb(0, 0, 255)].concat();
+        b.rmt_frame(5, &frame);
+        b.rmt_frame(6, &grb(1, 1, 1)); // another pin: not this strip
+        let s = b.ui_state(&[]).unwrap();
+        assert!(s.contains(r#""kind":"ws2812","pin":5,"updates":1,"leds":[[255,0,0],[0,255,0],[0,0,255]]"#), "{s}");
     }
 }
