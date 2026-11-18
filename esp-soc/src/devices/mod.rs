@@ -6,12 +6,16 @@ pub mod bmi270;
 pub mod bmm150;
 pub mod co5300;
 pub mod dcs_panel;
+pub mod dht;
 pub mod ft5x06;
 pub mod imu_motion;
 pub mod spi_bitbang;
+pub mod ssd1306;
 pub mod ws2812;
 
 pub use bmi270::{Bmi270, BMI270_ADDRESS};
+pub use dht::{Dht, DhtKind};
+pub use ssd1306::{Ssd1306, Ssd1306I2c};
 pub use bmm150::{Bmm150, Bmm150Trim};
 pub use dcs_panel::DcsPanel;
 pub use ft5x06::{Ft5x06, Ft5x06Points, FT5X06_ADDRESS};

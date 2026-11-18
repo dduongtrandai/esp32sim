@@ -13,18 +13,27 @@ pub use esp_soc::board::{Board, BoardEdge, BoardModel, NoBoard, VirtualCycle};
 
 pub mod atech14;
 pub mod stopwatch;
+pub mod vibe;
 pub mod waveshare_amoled18;
 pub mod waveshare_cam;
 pub mod waveshare_lcd4b;
 
 pub use atech14::*;
 pub use stopwatch::*;
+pub use vibe::VibeBoard;
 pub use waveshare_amoled18::*;
 pub use waveshare_cam::*;
 pub use waveshare_lcd4b::*;
 
 /// Board by name: `atech14` (default), `none`, `stopwatch` or a supported Waveshare board.
 pub fn make_board(name: &str) -> Option<Board> {
+    // `vibe:<json>`: a board assembled from vibe-iot's part list (see vibe.rs)
+    if let Some(config) = name.strip_prefix("vibe:") {
+        return match VibeBoard::from_config(config) {
+            Ok(b) => Some(Box::new(b)),
+            Err(e) => { eprintln!("{e}"); None }
+        };
+    }
     match name {
         "atech14" | "atech" => Some(Box::new(Atech14::new())),
         "none" | "bare" => Some(Box::new(NoBoard)),

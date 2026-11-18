@@ -89,6 +89,16 @@ impl<S: Soc> Machine<S> {
             self.ws.ring_updates = updates;
             w.send_text(&format!("{{\"t\":\"ring\",\"leds\":[{}]}}", leds_json(leds)));
         } }
+        // the parts of a configurable board (vibe): levels, PWM, sensor readings
+        let pins = self.bus.board_ref().ui_pwm_pins();
+        let pwm: Vec<(u8, Option<(f64, u32)>)> = pins.iter().map(|&p| (p, self.bus.pwm_output(p))).collect();
+        if let Some(state) = self.bus.board().ui_state(&pwm) {
+            if state != self.ws.ui_sent {
+                w.send_text(&format!("{{\"t\":\"vibe\",{}}}", state));
+                self.ws.ui_sent = state;
+            }
+        }
+        let board = self.bus.board_ref();
         // snapshot for late-joining clients: backlog, frame, ring
         if w.needs_hello() {
             let mut hello: Vec<Vec<u8>> = Vec::new();
@@ -183,6 +193,22 @@ impl<S: Soc> Machine<S> {
                 }
                 // the page's Restart on a native run: the board's reset button
                 "reset" if self.web_restart => { self.button_reset = true; self.bus.request_reset(esp_periph::RST_POWERON); *self.bus.irq_dirty() = true; }
+                // adc <pin> <volts>: a constant voltage on an analog pad, like the script's `adc`
+                "adc" => {
+                    let pin: Option<u8> = field("pin").and_then(|x| x.parse().ok());
+                    let v: Option<f32> = field("v").and_then(|x| x.parse().ok());
+                    if let (Some(pin), Some(v)) = (pin, v) {
+                        self.bus.analog_set(pin, esp_periph::AnalogSource::Const(v.clamp(0.0, 3.3)));
+                    }
+                }
+                // a part's control on a configurable board: {"t":"vibe","id":"2","field":"temperature","v":24.5}
+                "vibe" => {
+                    let id = field("id").unwrap_or_default();
+                    let f = field("field").unwrap_or_default();
+                    if let Some(v) = field("v").and_then(|x| x.parse::<f64>().ok()) {
+                        self.bus.board().ui_input(&id, &f, v);
+                    }
+                }
                 "touch" => { let x: u16 = field("x").and_then(|v| v.parse().ok()).unwrap_or(0); let y: u16 = field("y").and_then(|v| v.parse().ok()).unwrap_or(0);
                              let down = field("down").unwrap_or_default() == "1"; self.bus.touch_input(x, y, down); }
                 _ => {}

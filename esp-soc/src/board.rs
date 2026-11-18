@@ -155,6 +155,15 @@ pub trait BoardModel {
     /// Whether `camera_frame_with_clock` currently returns one whole JPEG file (its length
     /// is the file's) rather than `w`x`h` raw pixels. Queried only by capture adapters.
     fn camera_frame_is_jpeg(&self) -> bool { false }
+    /// Pins whose LEDC/MCPWM output `ui_state` wants (buzzers, dimmed LEDs).
+    fn ui_pwm_pins(&self) -> Vec<u8> { Vec::new() }
+    /// The board's parts for the page, as the members of a JSON object (no braces), published as
+    /// `{"t":"vibe",…}` whenever the text changes. `pwm` holds `(hz, duty of 65535)` per
+    /// `ui_pwm_pins` pin, or None while it carries no PWM.
+    fn ui_state(&mut self, _pwm: &[(u8, Option<(f64, u32)>)]) -> Option<String> { None }
+    /// A page control on part `id`: `field` set to `value` (a sensor's reading). Returns whether
+    /// the board has such a control.
+    fn ui_input(&mut self, _id: &str, _field: &str, _value: f64) -> bool { false }
 }
 
 pub type Board = Box<dyn BoardModel>;
