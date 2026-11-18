@@ -9,6 +9,7 @@ pub mod dcs_panel;
 pub mod dht;
 pub mod ft5x06;
 pub mod imu_motion;
+pub mod sensors;
 pub mod spi_bitbang;
 pub mod ssd1306;
 pub mod ws2812;

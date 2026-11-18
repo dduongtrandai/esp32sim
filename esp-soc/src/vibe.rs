@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use esp_periph::i2c::I2cDevice;
 
 use crate::board::{BoardEdge, BoardModel, SpiPins, VirtualCycle};
+use crate::devices::sensors::{self, SensorValues};
 use crate::devices::{DcsPanel, Dht, DhtKind, Ssd1306, Ssd1306I2c, Ws2812Chain};
 use crate::json::{parse_json, Json};
 
@@ -98,6 +99,8 @@ impl Tft {
 
 enum Part {
     Oled { addr: u8, state: Arc<Mutex<Ssd1306>> },
+    /// An I2C sensor (devices::sensors) whose readings the page sets.
+    Sensor { kind: &'static str, addr: u8, values: sensors::Shared },
     Tft(Box<Tft>),
     Strip { pin: u8, chain: Ws2812Chain },
     Dht(Dht),
@@ -139,6 +142,11 @@ impl VibeBoard {
                     let addr = p.i64_or("addr", 0x3c) as u8;
                     let height = p.i64_or("height", 64) as usize;
                     Some(Part::Oled { addr, state: Arc::new(Mutex::new(Ssd1306::new(height))) })
+                }
+                "bme280" | "bmp280" | "sht31" | "aht20" | "bh1750" | "mpu6050" => {
+                    let kind: &'static str = match kind { "bme280" => "bme280", "bmp280" => "bmp280", "sht31" => "sht31", "aht20" => "aht20", "bh1750" => "bh1750", _ => "mpu6050" };
+                    let addr = p.get("addr").and_then(Json::as_i64).map(|a| a as u8).or_else(|| sensors::default_address(kind));
+                    addr.map(|addr| Part::Sensor { kind, addr, values: Arc::new(Mutex::new(SensorValues::default())) })
                 }
                 "st7789" => Tft::new("st7789", p).map(|t| Part::Tft(Box::new(t))),
                 "ili9341" => Tft::new("ili9341", p).map(|t| Part::Tft(Box::new(t))),
@@ -236,6 +244,7 @@ impl BoardModel for VibeBoard {
     fn i2c_devices(&mut self) -> Vec<(u8, u8, Box<dyn I2cDevice>)> {
         self.parts.iter().filter_map(|(_, p)| match p {
             Part::Oled { addr, state } => Some((0u8, *addr, Box::new(Ssd1306I2c::new(state.clone())) as Box<dyn I2cDevice>)),
+            Part::Sensor { kind, addr, values } => sensors::make(kind, values.clone()).map(|d| (0u8, *addr, d)),
             _ => None,
         }).collect()
     }
@@ -299,7 +308,7 @@ impl BoardModel for VibeBoard {
             Part::Button { pin } | Part::Led { pin } | Part::Buzzer { pin, .. } | Part::Analog { pin } => Some(*pin),
             Part::Dht(d) => Some(d.pin),
             Part::Strip { pin, .. } => Some(*pin),
-            Part::Oled { .. } | Part::Tft(_) => None,
+            Part::Oled { .. } | Part::Tft(_) | Part::Sensor { .. } => None,
         })
     }
 
@@ -316,6 +325,17 @@ impl BoardModel for VibeBoard {
                 Part::Oled { addr, state } => {
                     let s = state.lock().expect("SSD1306 mutex poisoned");
                     format!("{{\"id\":\"{id}\",\"kind\":\"ssd1306\",\"addr\":{addr},\"on\":{},\"height\":{}}}", s.is_on(), s.height())
+                }
+                Part::Sensor { kind, addr, values } => {
+                    let v = *values.lock().expect("sensor values mutex poisoned");
+                    let fields = match *kind {
+                        "bme280" => format!("\"temperature\":{:.2},\"humidity\":{:.1},\"pressure\":{:.2}", v.temperature, v.humidity, v.pressure),
+                        "bmp280" => format!("\"temperature\":{:.2},\"pressure\":{:.2}", v.temperature, v.pressure),
+                        "sht31" | "aht20" => format!("\"temperature\":{:.2},\"humidity\":{:.1}", v.temperature, v.humidity),
+                        "bh1750" => format!("\"lux\":{:.1}", v.lux),
+                        _ => format!("\"temperature\":{:.2},\"ax\":{:.3},\"ay\":{:.3},\"az\":{:.3},\"gx\":{:.1},\"gy\":{:.1},\"gz\":{:.1}", v.temperature, v.accel[0], v.accel[1], v.accel[2], v.gyro[0], v.gyro[1], v.gyro[2]),
+                    };
+                    format!("{{\"id\":\"{id}\",\"kind\":\"{kind}\",\"addr\":{addr},{fields}}}")
                 }
                 Part::Tft(t) => format!(
                     "{{\"id\":\"{id}\",\"kind\":\"{}\",\"on\":{},\"width\":{},\"height\":{},\"frames\":{}}}",
@@ -345,6 +365,9 @@ impl BoardModel for VibeBoard {
     fn ui_input(&mut self, id: &str, field: &str, value: f64) -> bool {
         for (pid, p) in self.parts.iter_mut() {
             if pid != id { continue; }
+            if let Part::Sensor { values, .. } = p {
+                return values.lock().expect("sensor values mutex poisoned").set(field, value);
+            }
             if let Part::Dht(d) = p {
                 match field {
                     "temperature" => { d.temperature = value.clamp(-40.0, 80.0); return true; }
@@ -480,6 +503,28 @@ mod tests {
         // MADCTL 0x48 (MX | BGR) is how Adafruit_ILI9341 drives its BGR glass, mirrored in x:
         // the pixel drawn at (0, 0) shows at (0, 0), and red stays red
         assert_eq!(b.display().unwrap().2[0], 0xf800);
+    }
+
+    #[test]
+    fn i2c_sensors_attach_at_their_addresses_and_take_page_readings() {
+        let cfg = r#"{"parts":[
+            {"kind":"bme280","pins":{"sda":8,"scl":9},"addr":118},
+            {"kind":"sht31","pins":{"sda":8,"scl":9}},
+            {"kind":"aht20","pins":{"sda":8,"scl":9}},
+            {"kind":"bh1750","pins":{"sda":8,"scl":9}},
+            {"kind":"mpu6050","pins":{"sda":8,"scl":9}}
+        ]}"#;
+        let mut b = VibeBoard::from_config(cfg, HZ).unwrap();
+        let addrs: Vec<u8> = b.i2c_devices().iter().map(|d| d.1).collect();
+        assert_eq!(addrs, vec![0x76, 0x44, 0x38, 0x23, 0x68], "a configured address wins over the driver default");
+        assert!(b.ui_input("0", "pressure", 990.5));
+        assert!(b.ui_input("3", "lux", 1234.0));
+        assert!(b.ui_input("4", "az", -1.0));
+        assert!(!b.ui_input("4", "colour", 1.0));
+        let s = b.ui_state(&[]).unwrap();
+        assert!(s.contains(r#""kind":"bme280","addr":118,"temperature":24.00,"humidity":50.0,"pressure":990.50"#), "{s}");
+        assert!(s.contains(r#""kind":"bh1750","addr":35,"lux":1234.0"#), "{s}");
+        assert!(s.contains(r#""az":-1.000"#), "{s}");
     }
 
     #[test]
