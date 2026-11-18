@@ -8,6 +8,7 @@ pub mod co5300;
 pub mod dcs_panel;
 pub mod dht;
 pub mod ft5x06;
+pub mod hx711;
 pub mod imu_motion;
 pub mod sensors;
 pub mod spi_bitbang;
@@ -16,6 +17,7 @@ pub mod ws2812;
 
 pub use bmi270::{Bmi270, BMI270_ADDRESS};
 pub use dht::{Dht, DhtKind};
+pub use hx711::Hx711;
 pub use ssd1306::{Ssd1306, Ssd1306I2c};
 pub use bmm150::{Bmm150, Bmm150Trim};
 pub use dcs_panel::DcsPanel;

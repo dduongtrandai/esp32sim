@@ -11,6 +11,9 @@
 //! - `ws2812`: a chain of `count` LEDs on `data`, fed by RMT frames or decoded from GPIO pulses;
 //!   reported with each LED's colour.
 //! - `dht22` / `dht11`: the sensor on `data`; the page sets `temperature` and `humidity`.
+//! - `hx711`: the load-cell ADC on `dout` and `sck`, `rate` 10 or 80 conversions a second, with a
+//!   load cell of `capacity` grams and `sensitivity` mV/V on channel A; the page sets `weight`, and
+//!   `capacity`, `sensitivity` and `offset` (counts at no load) to calibrate against.
 //! - `led`, `buzzer`: outputs on `signal`, reported with their level and any PWM on the pin.
 //!   A buzzer toggled by software reports the frequency of its edges.
 //! - `button`: an active-low input on `signal`, idle high; the page drives it with `btn`.
@@ -21,7 +24,7 @@ use esp_periph::i2c::I2cDevice;
 
 use crate::board::{BoardEdge, BoardModel, SpiPins, VirtualCycle};
 use crate::devices::sensors::{self, SensorValues};
-use crate::devices::{DcsPanel, Dht, DhtKind, Ssd1306, Ssd1306I2c, Ws2812Chain};
+use crate::devices::{DcsPanel, Dht, DhtKind, Hx711, Ssd1306, Ssd1306I2c, Ws2812Chain};
 use crate::json::{parse_json, Json};
 
 /// An SPI TFT module: an ST77xx/ILI9341 controller (`DcsPanel`) behind its glass. The RAM is
@@ -104,6 +107,7 @@ enum Part {
     Tft(Box<Tft>),
     Strip { pin: u8, chain: Ws2812Chain },
     Dht(Dht),
+    Hx711(Box<Hx711>),
     Led { pin: u8 },
     Buzzer { pin: u8, rises: [VirtualCycle; 2] },
     Button { pin: u8 },
@@ -160,6 +164,15 @@ impl VibeBoard {
                     if let Some(h) = p.get("humidity").and_then(Json::as_f64) { d.humidity = h; }
                     Part::Dht(d)
                 }),
+                "hx711" => pin(p, "dout").zip(pin(p, "sck")).filter(|(d, s)| d != s).map(|(dout, sck)| {
+                    let mut h = Hx711::new(dout, sck, p.i64_or("rate", 10).clamp(0, 80) as u32, us);
+                    let num = |k: &str| p.get(k).and_then(Json::as_f64).filter(|v| v.is_finite());
+                    if let Some(v) = num("capacity").filter(|&v| v > 0.0) { h.capacity = v; }
+                    if let Some(v) = num("sensitivity").filter(|&v| v > 0.0) { h.sensitivity = v; }
+                    if let Some(v) = num("offset") { h.offset = v; }
+                    if let Some(v) = num("weight") { h.weight = v; }
+                    Part::Hx711(Box::new(h))
+                }),
                 "led" => pin(p, "signal").map(|pin| Part::Led { pin }),
                 "buzzer" => pin(p, "signal").map(|pin| Part::Buzzer { pin, rises: [0; 2] }),
                 "button" => pin(p, "signal").map(|pin| Part::Button { pin }),
@@ -188,6 +201,10 @@ impl VibeBoard {
         self.parts.iter_mut().filter_map(|(_, p)| match p { Part::Dht(d) => Some(d), _ => None })
     }
 
+    fn hx711s(&mut self) -> impl Iterator<Item = &mut Hx711> {
+        self.parts.iter_mut().filter_map(|(_, p)| match p { Part::Hx711(h) => Some(&mut **h), _ => None })
+    }
+
     fn level(&self, pin: u8) -> bool { self.levels >> pin & 1 == 1 }
 }
 
@@ -207,6 +224,9 @@ impl BoardModel for VibeBoard {
             }
         }
         for d in self.dhts() { d.host_drive(cycle, enabled, output); }
+        for h in self.hx711s() {
+            if changes.iter().any(|&(p, _)| p == h.sck) { h.host_drive(cycle, enabled, output); }
+        }
         for t in self.tfts() {
             for &(pin, level) in changes {
                 if Some(pin) == t.cs { t.cs_high = level; }
@@ -271,11 +291,13 @@ impl BoardModel for VibeBoard {
     /// for the other pixel-streaming panels.
     fn display_quiet_push(&self) -> bool { matches!(self.screen(), Some(Part::Tft(_))) }
 
-    /// Buttons idle high (pressed pulls them low); the DHT line idles high on its pull-up.
+    /// Buttons idle high (pressed pulls them low); the DHT line idles high on its pull-up; an
+    /// HX711 drives DOUT itself.
     fn input_levels(&self) -> Vec<(u8, bool)> {
         self.parts.iter().filter_map(|(_, p)| match p {
             Part::Button { pin } => Some((*pin, true)),
             Part::Dht(d) => Some((d.pin, true)),
+            Part::Hx711(h) => Some((h.dout, h.dout_level())),
             _ => None,
         }).collect()
     }
@@ -283,6 +305,7 @@ impl BoardModel for VibeBoard {
     fn next_deadline(&self) -> Option<VirtualCycle> {
         self.parts.iter().filter_map(|(_, p)| match p {
             Part::Dht(d) => d.next_deadline(),
+            Part::Hx711(h) => h.next_deadline(),
             Part::Strip { chain, .. } => chain.gpio_deadline(),
             _ => None,
         }).min()
@@ -291,11 +314,13 @@ impl BoardModel for VibeBoard {
     fn advance_to(&mut self, cycle: VirtualCycle) {
         self.now = self.now.max(cycle);
         for d in self.dhts() { d.advance_to(cycle); }
+        for h in self.hx711s() { h.advance_to(cycle); }
         for (_, chain) in self.strips() { chain.advance_gpio(cycle); }
     }
 
     fn take_edges(&mut self) -> Vec<BoardEdge> {
         let mut edges: Vec<BoardEdge> = self.dhts().flat_map(|d| d.take_edges()).collect();
+        edges.extend(self.hx711s().flat_map(|h| h.take_edges()));
         edges.sort_by_key(|e| e.cycle);
         edges
     }
@@ -307,6 +332,7 @@ impl BoardModel for VibeBoard {
         self.parts.iter().find(|(id, _)| id.parse() == Ok(i)).and_then(|(_, p)| match p {
             Part::Button { pin } | Part::Led { pin } | Part::Buzzer { pin, .. } | Part::Analog { pin } => Some(*pin),
             Part::Dht(d) => Some(d.pin),
+            Part::Hx711(h) => Some(h.dout),
             Part::Strip { pin, .. } => Some(*pin),
             Part::Oled { .. } | Part::Tft(_) | Part::Sensor { .. } => None,
         })
@@ -347,6 +373,9 @@ impl BoardModel for VibeBoard {
                 Part::Dht(d) => format!(
                     "{{\"id\":\"{id}\",\"kind\":\"{}\",\"pin\":{},\"temperature\":{:.1},\"humidity\":{:.1},\"reads\":{}}}",
                     if d.kind == DhtKind::Dht11 { "dht11" } else { "dht22" }, d.pin, d.temperature, d.humidity, d.reads),
+                Part::Hx711(h) => format!(
+                    "{{\"id\":\"{id}\",\"kind\":\"hx711\",\"pin\":{},\"sck\":{},\"weight\":{:.1},\"capacity\":{:.0},\"sensitivity\":{:.3},\"offset\":{:.0},\"gain\":{},\"raw\":{},\"reads\":{}}}",
+                    h.dout, h.sck, h.weight, h.capacity, h.sensitivity, h.offset, h.gain(), h.last, h.reads),
                 Part::Led { pin } => format!("{{\"id\":\"{id}\",\"kind\":\"led\",\"pin\":{pin},\"on\":{},\"pwm\":{}}}", self.level(*pin), fmt_pwm(pwm_of(*pin))),
                 Part::Buzzer { pin, rises } => {
                     // a software tone: the period between the last two rising edges, while recent
@@ -372,6 +401,16 @@ impl BoardModel for VibeBoard {
                 match field {
                     "temperature" => { d.temperature = value.clamp(-40.0, 80.0); return true; }
                     "humidity" => { d.humidity = value.clamp(0.0, 100.0); return true; }
+                    _ => {}
+                }
+            }
+            if let Part::Hx711(h) = p {
+                if !value.is_finite() { return false; }
+                match field {
+                    "weight" => { h.weight = value.clamp(-1e6, 1e6); return true; }
+                    "capacity" if value > 0.0 => { h.capacity = value.min(1e7); return true; }
+                    "sensitivity" if value > 0.0 => { h.sensitivity = value.min(100.0); return true; }
+                    "offset" => { h.offset = value.clamp(-8_388_608.0, 8_388_607.0); return true; }
                     _ => {}
                 }
             }
@@ -441,6 +480,32 @@ mod tests {
         let first = b.next_deadline().expect("the DHT answers");
         b.advance_to(first);
         assert_eq!(b.take_edges(), vec![BoardEdge { cycle: first, pin: 4, level: false }]);
+    }
+
+    #[test]
+    fn an_hx711_answers_its_clock_through_the_board() {
+        let cfg = r#"{"parts":[{"kind":"hx711","pins":{"dout":4,"sck":5},"capacity":5000,"sensitivity":1.0,"offset":-1000},
+            {"kind":"hx711","pins":{"dout":6,"sck":6}}]}"#;
+        let mut b = VibeBoard::from_config(cfg, HZ).unwrap();
+        assert_eq!(b.parts.len(), 1, "DOUT and PD_SCK on one pin is not a wiring");
+        assert_eq!(b.input_levels(), vec![(4, true)]);
+        assert!(b.ui_input("0", "weight", 500.0));
+        assert!(!b.ui_input("0", "capacity", -1.0));
+        let ready = b.next_deadline().expect("the first conversion");
+        assert_eq!(ready, 400 * HZ / 1000);
+        b.advance_to(ready);
+        assert_eq!(b.take_edges(), vec![BoardEdge { cycle: ready, pin: 4, level: false }]);
+        // 213 748 = 0x0342f4: the first six bits are 0, the seventh 1; DOUT only moves on a change
+        let mut bits = Vec::new();
+        for n in 0..7u64 {
+            let t = ready + n * 2 * US;
+            b.gpio_output_at(t, &[(5, true)], 1 << 5, 1 << 5);
+            bits.push(b.take_edges().last().map(|e| e.level));
+            b.gpio_output_at(t + US, &[(5, false)], 1 << 5, 0);
+        }
+        assert_eq!(bits, vec![None, None, None, None, None, None, Some(true)]);
+        let s = b.ui_state(&[]).unwrap();
+        assert!(s.contains(r#""kind":"hx711","pin":4,"sck":5,"weight":500.0,"capacity":5000,"sensitivity":1.000,"offset":-1000,"gain":128,"raw":213748"#), "{s}");
     }
 
     #[test]
