@@ -148,7 +148,7 @@ mod tests {
         d.advance_to(u64::MAX - 1);
         let edges = d.take_edges();
         assert_eq!(edges.len(), 2 + 80 + 1);
-        assert_eq!(edges[0].level, false);
+        assert!(!edges[0].level);
         assert_eq!(edges[1].cycle - edges[0].cycle, 80 * US);
         assert_eq!(d.take_released(), vec![4]);
         let bytes = decode(&edges);

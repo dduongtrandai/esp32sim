@@ -12,6 +12,14 @@ pub mod cyd;
 pub use tdisplay::*;
 
 pub fn make_board(name: &str) -> Option<esp_soc::Board> {
+    // `vibe-esp32:<json>`: a board assembled from vibe-iot's part list (esp_soc::vibe). Its own
+    // prefix: esp32sim asks this factory before the S3's, which builds `vibe:`.
+    if let Some(config) = name.strip_prefix("vibe-esp32:") {
+        return match esp_soc::vibe::VibeBoard::from_config(config, crate::periph::CPU_HZ) {
+            Ok(b) => Some(Box::new(b)),
+            Err(e) => { eprintln!("{e}"); None }
+        };
+    }
     match name {
         "none" | "bare" | "esp32dev" => Some(Box::new(esp_soc::NoBoard)),
         "ttgo-tdisplay" | "tdisplay" => Some(Box::new(TtgoTDisplay::new())),
@@ -27,6 +35,7 @@ mod tests {
     #[test]
     fn classic_boards_reject_s3_names() {
         for name in ["none", "bare", "esp32dev", "ttgo-tdisplay", "tdisplay", "ulanzi-tc001", "tc001"] { assert!(super::make_board(name).is_some()); }
-        for name in ["waveshare-amoled18-v2", "waveshare-lcd4b", "atech14", "waveshare-c6-lcd147"] { assert!(super::make_board(name).is_none()); }
+        for name in ["waveshare-amoled18-v2", "waveshare-lcd4b", "atech14", "waveshare-c6-lcd147", "vibe:{\"parts\":[]}"] { assert!(super::make_board(name).is_none()); }
+        assert!(super::make_board("vibe-esp32:{\"parts\":[]}").is_some(), "the classic factory builds its own vibe board");
     }
 }
