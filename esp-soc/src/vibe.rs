@@ -13,7 +13,8 @@
 //! - `dht22` / `dht11`: the sensor on `data`; the page sets `temperature` and `humidity`.
 //! - `hx711`: the load-cell ADC on `dout` and `sck`, `rate` 10 or 80 conversions a second, with a
 //!   load cell of `capacity` grams and `sensitivity` mV/V on channel A; the page sets `weight`, and
-//!   `capacity`, `sensitivity` and `offset` (counts at no load) to calibrate against.
+//!   `capacity`, `sensitivity` and `offset` (counts at no load) to calibrate against, and `noise`
+//!   (counts rms, 0 for exact words). A `weight` from the page rings and settles like a real load.
 //! - `led`, `buzzer`: outputs on `signal`, reported with their level and any PWM on the pin.
 //!   A buzzer toggled by software reports the frequency of its edges.
 //! - `button`: an active-low input on `signal`, idle high; the page drives it with `btn`.
@@ -171,6 +172,7 @@ impl VibeBoard {
                     if let Some(v) = num("sensitivity").filter(|&v| v > 0.0) { h.sensitivity = v; }
                     if let Some(v) = num("offset") { h.offset = v; }
                     if let Some(v) = num("weight") { h.weight = v; }
+                    if let Some(v) = num("noise").filter(|&v| v >= 0.0) { h.noise = v.min(1e6); }
                     Part::Hx711(Box::new(h))
                 }),
                 "led" => pin(p, "signal").map(|pin| Part::Led { pin }),
@@ -374,8 +376,8 @@ impl BoardModel for VibeBoard {
                     "{{\"id\":\"{id}\",\"kind\":\"{}\",\"pin\":{},\"temperature\":{:.1},\"humidity\":{:.1},\"reads\":{}}}",
                     if d.kind == DhtKind::Dht11 { "dht11" } else { "dht22" }, d.pin, d.temperature, d.humidity, d.reads),
                 Part::Hx711(h) => format!(
-                    "{{\"id\":\"{id}\",\"kind\":\"hx711\",\"pin\":{},\"sck\":{},\"weight\":{:.1},\"capacity\":{:.0},\"sensitivity\":{:.3},\"offset\":{:.0},\"gain\":{},\"raw\":{},\"reads\":{}}}",
-                    h.dout, h.sck, h.weight, h.capacity, h.sensitivity, h.offset, h.gain(), h.last, h.reads),
+                    "{{\"id\":\"{id}\",\"kind\":\"hx711\",\"pin\":{},\"sck\":{},\"weight\":{:.1},\"capacity\":{:.0},\"sensitivity\":{:.3},\"offset\":{:.0},\"gain\":{},\"raw\":{},\"reads\":{},\"noise\":{:.0}}}",
+                    h.dout, h.sck, h.weight, h.capacity, h.sensitivity, h.offset, h.gain(), h.last, h.reads, h.noise),
                 Part::Led { pin } => format!("{{\"id\":\"{id}\",\"kind\":\"led\",\"pin\":{pin},\"on\":{},\"pwm\":{}}}", self.level(*pin), fmt_pwm(pwm_of(*pin))),
                 Part::Buzzer { pin, rises } => {
                     // a software tone: the period between the last two rising edges, while recent
@@ -407,7 +409,8 @@ impl BoardModel for VibeBoard {
             if let Part::Hx711(h) = p {
                 if !value.is_finite() { return false; }
                 match field {
-                    "weight" => { h.weight = value.clamp(-1e6, 1e6); return true; }
+                    "weight" => { h.set_weight(value.clamp(-1e6, 1e6)); return true; }
+                    "noise" if value >= 0.0 => { h.noise = value.min(1e6); return true; }
                     "capacity" if value > 0.0 => { h.capacity = value.min(1e7); return true; }
                     "sensitivity" if value > 0.0 => { h.sensitivity = value.min(100.0); return true; }
                     "offset" => { h.offset = value.clamp(-8_388_608.0, 8_388_607.0); return true; }
@@ -484,13 +487,14 @@ mod tests {
 
     #[test]
     fn an_hx711_answers_its_clock_through_the_board() {
-        let cfg = r#"{"parts":[{"kind":"hx711","pins":{"dout":4,"sck":5},"capacity":5000,"sensitivity":1.0,"offset":-1000},
+        let cfg = r#"{"parts":[{"kind":"hx711","pins":{"dout":4,"sck":5},"capacity":5000,"sensitivity":1.0,"offset":-1000,"weight":500,"noise":0},
             {"kind":"hx711","pins":{"dout":6,"sck":6}}]}"#;
         let mut b = VibeBoard::from_config(cfg, HZ).unwrap();
         assert_eq!(b.parts.len(), 1, "DOUT and PD_SCK on one pin is not a wiring");
         assert_eq!(b.input_levels(), vec![(4, true)]);
-        assert!(b.ui_input("0", "weight", 500.0));
+        assert!(b.ui_input("0", "capacity", 5000.0));
         assert!(!b.ui_input("0", "capacity", -1.0));
+        assert!(!b.ui_input("0", "noise", -1.0));
         let ready = b.next_deadline().expect("the first conversion");
         assert_eq!(ready, 400 * HZ / 1000);
         b.advance_to(ready);

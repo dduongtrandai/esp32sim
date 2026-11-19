@@ -12,9 +12,24 @@
 //! The bridge is ratiometric, so the word does not depend on the supply: the differential input is
 //! `weight / capacity * sensitivity` (mV/V) of the excitation, and the full scale is +-0.5 of the
 //! supply over the gain, which gives `code = 2 * gain * 2^23 * weight / capacity * sensitivity / 1000`.
-//! `offset` is the bridge's zero error in counts at gain 128. There is no noise: a reading is
-//! repeatable, so the firmware's averaging and tare logic see exactly what the page set.
+//! `offset` is the bridge's zero error in counts at gain 128.
+//!
+//! Two things make it read like a real scale rather than a number the page typed:
+//! - A change of weight (`set_weight`: a cup put down or picked up) does not land at once. The
+//!   platform rings like a damped spring, overshooting by about a third and settling within about
+//!   a second, which is what a sketch that waits for a stable reading has to cope with.
+//! - Each conversion carries Gaussian noise, `noise` counts rms at gain 128 (100 by default,
+//!   about 0.2 g on a 5 kg cell at 1 mV/V), from a seeded generator so a run repeats exactly.
+//!   Set it to 0 for exact words.
 use crate::board::{BoardEdge, VirtualCycle};
+
+/// The platform's ringing after a step: decay time constant and frequency.
+const RING_TAU_S: f64 = 0.1;
+const RING_HZ: f64 = 4.0;
+/// Past this, the ringing is below a part in 10^6 and the load is the set weight.
+const RING_END_S: f64 = 1.5;
+/// Noise in counts rms at gain 128, unless the page says otherwise.
+pub const DEFAULT_NOISE: f64 = 100.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -34,8 +49,10 @@ enum Phase {
 pub struct Hx711 {
     pub dout: u8,
     pub sck: u8,
-    /// Grams on the load cell.
+    /// Grams on the load cell, once it has settled. `set_weight` changes it the way a load does.
     pub weight: f64,
+    /// Noise in counts rms at gain 128; 0 for exact words.
+    pub noise: f64,
     /// The load cell's rated capacity, grams.
     pub capacity: f64,
     /// The load cell's rated output, mV/V.
@@ -58,6 +75,12 @@ pub struct Hx711 {
     sck_rose: VirtualCycle,
     next_ready: Option<VirtualCycle>,
     out: Vec<BoardEdge>,
+    /// The step still ringing out: grams the load was off from `weight` when it began, and when.
+    /// The start is the first advance after the change, the first time the device learns the time.
+    step: Option<(f64, Option<VirtualCycle>)>,
+    /// The latest cycle the device has seen.
+    seen: VirtualCycle,
+    rng: u32,
 }
 
 impl Hx711 {
@@ -67,23 +90,62 @@ impl Hx711 {
         let ms = cycles_per_us * 1000;
         let settle = if fast { 50 * ms } else { 400 * ms };
         Self {
-            dout, sck, weight: 0.0, capacity: 5000.0, sensitivity: 1.0, offset: 0.0, reads: 0, last: 0, cycles_per_us,
-            period: if fast { 12_500 * cycles_per_us } else { 100 * ms }, settle,
+            dout, sck, weight: 0.0, noise: DEFAULT_NOISE, capacity: 5000.0, sensitivity: 1.0, offset: 0.0, reads: 0, last: 0,
+            cycles_per_us, period: if fast { 12_500 * cycles_per_us } else { 100 * ms }, settle,
             phase: Phase::Converting, mode: 25, word: 0, dout_level: true, sck_high: false, sck_rose: 0,
-            next_ready: Some(settle), out: Vec::new(),
+            next_ready: Some(settle), out: Vec::new(), step: None, seen: 0,
+            rng: 0x9e37_79b9 ^ u32::from(dout) << 8 ^ u32::from(sck),
         }
+    }
+
+    /// A load put on or taken off: the platform rings from where it was to `grams`.
+    pub fn set_weight(&mut self, grams: f64) {
+        let from = self.load_at(self.seen);
+        self.weight = grams;
+        self.step = Some((from - grams, None));
+    }
+
+    /// Grams the bridge feels at `cycle`: the weight, plus what is left of the last step's ringing.
+    pub fn load_at(&self, cycle: VirtualCycle) -> f64 {
+        let Some((delta, start)) = self.step else { return self.weight };
+        let dt = start.map_or(0, |s| cycle.saturating_sub(s)) as f64 / (self.cycles_per_us as f64 * 1e6);
+        if dt >= RING_END_S { return self.weight; }
+        self.weight + delta * (-dt / RING_TAU_S).exp() * (std::f64::consts::TAU * RING_HZ * dt).cos()
+    }
+
+    /// mulberry32: small, fast, and the same sequence in the TypeScript port.
+    fn next_u32(&mut self) -> u32 {
+        self.rng = self.rng.wrapping_add(0x6d2b_79f5);
+        let mut t = self.rng;
+        t = (t ^ t >> 15).wrapping_mul(t | 1);
+        t ^= t.wrapping_add((t ^ t >> 7).wrapping_mul(t | 61));
+        t ^ t >> 14
+    }
+
+    /// A standard normal sample (Box-Muller).
+    fn gaussian(&mut self) -> f64 {
+        let u1 = (f64::from(self.next_u32()) + 1.0) / 4_294_967_296.0;
+        let u2 = f64::from(self.next_u32()) / 4_294_967_296.0;
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    fn note_time(&mut self, cycle: VirtualCycle) {
+        self.seen = self.seen.max(cycle);
+        if let Some((_, start @ None)) = &mut self.step { *start = Some(cycle); }
     }
 
     /// Channel A at gain 128 or 64, or channel B (nothing wired: reads 0).
     pub fn gain(&self) -> u32 { match self.mode { 26 => 32, 27 => 64, _ => 128 } }
 
-    /// The word a conversion in the current mode makes of the page's values.
-    pub fn code(&self) -> i32 {
+    /// The word a conversion in the current mode makes of the settled weight, without noise.
+    pub fn code(&self) -> i32 { self.code_of(self.weight, 0.0) }
+
+    fn code_of(&self, grams: f64, noise: f64) -> i32 {
         if self.mode == 26 { return 0; }
         let gain = self.gain() as f64;
         let cap = if self.capacity > 0.0 { self.capacity } else { 1.0 };
-        let fraction = self.weight / cap * self.sensitivity / 1000.0;
-        let code = 2.0 * gain * 8_388_608.0 * fraction + self.offset * gain / 128.0;
+        let fraction = grams / cap * self.sensitivity / 1000.0;
+        let code = 2.0 * gain * 8_388_608.0 * fraction + (self.offset + noise) * gain / 128.0;
         code.round().clamp(-8_388_608.0, 8_388_607.0) as i32
     }
 
@@ -141,7 +203,8 @@ impl Hx711 {
     fn convert(&mut self, at: VirtualCycle) {
         if let Phase::Trailing(n) = self.phase { self.mode = n; }
         if let Phase::Shifting(_) = self.phase { return; } // the host is reading the last word: it keeps it
-        self.last = self.code();
+        let noise = if self.noise > 0.0 { self.gaussian() * self.noise } else { 0.0 };
+        self.last = self.code_of(self.load_at(at), noise);
         self.word = self.last as u32 & 0xff_ffff;
         self.phase = Phase::Ready;
         self.set_dout(at, false);
@@ -155,6 +218,7 @@ impl Hx711 {
     }
 
     pub fn advance_to(&mut self, cycle: VirtualCycle) {
+        self.note_time(cycle);
         loop {
             let down = self.power_down_at().filter(|&t| t <= cycle);
             let ready = self.next_ready.filter(|&t| t <= cycle);
@@ -185,6 +249,13 @@ mod tests {
     const DOUT: u8 = 4;
     const SCK: u8 = 5;
 
+    /// A device with exact words: these tests check the protocol, not the noise.
+    fn exact(rate: u32) -> Hx711 {
+        let mut h = Hx711::new(DOUT, SCK, rate, US);
+        h.noise = 0.0;
+        h
+    }
+
     fn sck(h: &mut Hx711, at: u64, high: bool) { h.host_drive(at, 1 << SCK, if high { 1 << SCK } else { 0 }); }
 
     /// What bogde/HX711's read() does: wait for DOUT low, 24 pulses sampling DOUT while PD_SCK is
@@ -211,7 +282,7 @@ mod tests {
 
     #[test]
     fn the_first_word_comes_after_settling() {
-        let mut h = Hx711::new(DOUT, SCK, 10, US);
+        let mut h = exact(10);
         assert!(h.dout_level());
         assert_eq!(h.next_deadline(), Some(400 * MS));
         h.advance_to(400 * MS - 1);
@@ -223,7 +294,7 @@ mod tests {
 
     #[test]
     fn a_read_returns_the_weight_in_counts() {
-        let mut h = Hx711::new(DOUT, SCK, 10, US);
+        let mut h = exact(10);
         h.weight = 500.0;
         h.offset = -12_345.0;
         // 500 g of 5 kg at 1 mV/V, gain 128: 2 * 128 * 2^23 * 0.1 * 0.001 = 214 748
@@ -243,7 +314,7 @@ mod tests {
 
     #[test]
     fn negative_words_and_saturation() {
-        let mut h = Hx711::new(DOUT, SCK, 10, US);
+        let mut h = exact(10);
         h.weight = -100.0;
         let (v, _) = read(&mut h, 400 * MS, 1);
         assert_eq!(v, -42_950);
@@ -253,7 +324,7 @@ mod tests {
 
     #[test]
     fn extra_pulses_choose_the_next_gain_and_channel() {
-        let mut h = Hx711::new(DOUT, SCK, 10, US);
+        let mut h = exact(10);
         h.weight = 500.0;
         read(&mut h, 400 * MS, 3); // 27 pulses: channel A, gain 64
         let (v, _) = read(&mut h, 500 * MS, 2); // 26: channel B
@@ -266,7 +337,7 @@ mod tests {
 
     #[test]
     fn eighty_samples_per_second() {
-        let mut h = Hx711::new(DOUT, SCK, 80, US);
+        let mut h = exact(80);
         assert_eq!(h.next_deadline(), Some(50 * MS));
         let (_, t) = read(&mut h, 50 * MS, 1);
         h.advance_to(t);
@@ -275,7 +346,7 @@ mod tests {
 
     #[test]
     fn holding_pd_sck_high_powers_down_and_low_resets() {
-        let mut h = Hx711::new(DOUT, SCK, 10, US);
+        let mut h = exact(10);
         read(&mut h, 400 * MS, 3); // gain 64 for the next conversion
         sck(&mut h, 450 * MS, true);
         assert_eq!(h.next_deadline(), Some(450 * MS + 60 * US), "power-down after 60 us high");
@@ -291,7 +362,7 @@ mod tests {
 
     #[test]
     fn a_word_being_read_is_not_replaced_by_the_next_conversion() {
-        let mut h = Hx711::new(DOUT, SCK, 10, US);
+        let mut h = exact(10);
         h.weight = 500.0;
         h.advance_to(400 * MS);
         // 12 bits, then the host stalls past the next conversion (but not 60 us with PD_SCK high)
@@ -302,5 +373,44 @@ mod tests {
         let mut v = 0u32;
         for _ in 0..12 { sck(&mut h, 520 * MS, true); v = v << 1 | h.dout_level() as u32; sck(&mut h, 520 * MS + US, false); }
         assert_eq!(v, 214_748 & 0xfff, "the low 12 bits are still the old word's");
+    }
+
+    /// Reads one word at each conversion from `from`, `n` of them, in grams (5 kg at 1 mV/V, gain 128).
+    fn grams(h: &mut Hx711, from: u64, n: u64) -> Vec<f64> {
+        (0..n).map(|i| read(h, from + i * 100 * MS, 1).0 as f64 / 429.4967).collect()
+    }
+
+    #[test]
+    fn a_new_weight_rings_then_settles() {
+        let mut h = exact(10);
+        h.advance_to(350 * MS);
+        h.set_weight(550.0); // a cup of water put down
+        let g = grams(&mut h, 400 * MS, 12);
+        assert!(g[0].abs() < 1.0, "the first word after the change still reads the old load: {g:?}");
+        assert!(g.iter().any(|&w| w > 600.0), "it overshoots: {g:?}");
+        assert!((g[11] - 550.0).abs() < 0.01, "and settles within about a second: {g:?}");
+        // picked up again: it rings around 0 and comes back to it
+        h.set_weight(0.0);
+        let g = grams(&mut h, 1600 * MS, 15);
+        assert!(g.iter().any(|&w| w < -50.0), "it undershoots: {g:?}");
+        assert!(g[14].abs() < 0.01, "{g:?}");
+    }
+
+    #[test]
+    fn noise_is_gaussian_and_repeatable() {
+        let words = |noise: f64| {
+            let mut h = Hx711::new(DOUT, SCK, 80, US);
+            h.noise = noise;
+            h.weight = 500.0;
+            (0..400u64).map(|i| read(&mut h, 50 * MS + i * 12_500 * US, 1).0).collect::<Vec<_>>()
+        };
+        let a = words(100.0);
+        assert_eq!(a, words(100.0), "a run repeats exactly");
+        let n = a.len() as f64;
+        let mean = a.iter().map(|&v| v as f64).sum::<f64>() / n;
+        let sd = (a.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
+        assert!((mean - 214_748.0).abs() < 20.0, "mean {mean}");
+        assert!((sd - 100.0).abs() < 15.0, "sd {sd}");
+        assert!(words(0.0).iter().all(|&v| v == 214_748));
     }
 }
