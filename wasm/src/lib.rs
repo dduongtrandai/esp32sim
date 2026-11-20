@@ -9,6 +9,7 @@
 use esp_soc::web::{json_escape, WebServer};
 use esp_soc::{Machine, Soc, SocBus};
 
+mod js_parts;
 mod machine;
 #[cfg(any(test, feature = "psram-tests"))]
 pub mod psram_tests;
@@ -123,6 +124,7 @@ unsafe fn text<'a>(ptr: *const u8, len: usize) -> &'a str {
 #[no_mangle]
 pub unsafe extern "C" fn esp32sim_new(board: *const u8, board_len: usize, flash_mb: u32, psram_mb: u32) -> *mut Emu {
     std::panic::set_hook(Box::new(|info| log(&format!("[emu] panic: {}", info))));
+    esp_soc::js_parts::set_host(Some(Box::new(js_parts::WasmJsHost)));
     // SAFETY: The caller provides a readable board-name buffer for this call.
     let board = unsafe { text(board, board_len) }.to_string();
     let Some(flash_bytes) = mib_bytes(flash_mb.max(1)) else { log("[emu] flash size exceeds the supported memory range"); return std::ptr::null_mut() };

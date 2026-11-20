@@ -13,6 +13,7 @@ pub mod elf;
 pub mod gpio;
 pub mod host;
 pub mod image;
+pub mod js_parts;
 pub mod json;
 pub mod load;
 pub mod machine;
