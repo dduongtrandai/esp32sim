@@ -37,6 +37,10 @@ impl PcmSource {
         Ok(Self { pins: Some(pins), queue: ClockedQueue::new(rate, [0; 2], false)?, tone: None, clip: None })
     }
     pub fn queued_frames(&self) -> usize { self.queue.frames.len() }
+    /// The wiring a routed source was made with; None for a per-controller input.
+    pub fn pins(&self) -> Option<PcmPins> { self.pins }
+    /// The rate its pushed frames are played at, Hz.
+    pub fn rate(&self) -> u32 { self.queue.rate }
     /// Routed sources retain the newest two seconds; per-port input accepts up to 65536 frames.
     pub fn push(&mut self, frames: &[[i16; 2]]) -> usize {
         self.tone = None;

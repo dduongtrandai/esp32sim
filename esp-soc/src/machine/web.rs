@@ -124,6 +124,25 @@ impl<S: Soc> Machine<S> {
         }
     }
 
+    /// A microphone wired to `bclk`/`ws`/`data`: the routed PCM source on those pins (made on
+    /// first use, remade when the page's rate changes) gets `frames`, recorded at `rate` Hz.
+    /// The receiver whose matrix route matches the pins hears it; the source keeps time by
+    /// itself, so the page pushes as emulated time goes by and an underrun is silence.
+    pub fn push_mic(&mut self, bclk: u8, ws: u8, data: u8, rate: u32, frames: &[[i16; 2]]) -> Result<(), &'static str> {
+        use esp_periph::i2s::{PcmPins, PcmSource};
+        let pins = PcmPins::I2s { bclk, ws, data };
+        let Some(bank) = self.bus.attach_pcm_sources() else { return Err("this chip has no routed I2S input") };
+        let slot = bank.inputs.iter().position(|s| s.as_ref().is_some_and(|s| s.pins() == Some(pins)));
+        let fresh = || PcmSource::new(rate, pins);
+        let i = match slot {
+            Some(i) if bank.inputs[i].as_ref().is_some_and(|s| s.rate() == rate) => i,
+            Some(i) => { bank.inputs[i] = Some(fresh()?); i }
+            None => { bank.inputs.push(Some(fresh()?)); bank.inputs.len() - 1 }
+        };
+        if let Some(source) = bank.inputs[i].as_mut() { source.push(frames); }
+        Ok(())
+    }
+
     // Host input is accepted at run boundaries without advancing device time. The periodic
     // poll remains necessary for native callers that run continuously rather than in slices.
     pub(super) fn web_poll_input(&mut self) {
@@ -139,6 +158,15 @@ impl<S: Soc> Machine<S> {
                     if let Err(error) = self.bus.board().set_camera_picture(picture) {
                         w.send_text(&format!("{{\"t\":\"camera-error\",\"message\":\"{error}\"}}"));
                     }
+                }
+            }
+            // type 4: a microphone on I2S pins, from the browser —
+            // [4][bclk u8][ws u8][data u8][rate u32 le][int16 le mono…]
+            if b.len() >= 8 && b[0] == 4 {
+                let rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                let frames: Vec<[i16; 2]> = b[8..].chunks_exact(2).map(|s| { let v = i16::from_le_bytes([s[0], s[1]]); [v, v] }).collect();
+                if let Err(error) = self.push_mic(b[1], b[2], b[3], rate, &frames) {
+                    w.send_text(&format!("{{\"t\":\"emu\",\"msg\":\"mic: {error}\"}}"));
                 }
             }
         }

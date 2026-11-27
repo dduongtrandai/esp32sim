@@ -19,11 +19,16 @@
 //!   A buzzer toggled by software reports the frequency of its edges.
 //! - `button`: an active-low input on `signal`, idle high; the page drives it with `btn`.
 //! - `analog`: a voltage on `signal`'s ADC pad; the page sets it with `adc`.
+//! - any part with a `js` object: a model the host runs (`crate::js_parts`). `js` says what the
+//!   board must route to it: `listens` (pins whose drive state it hears), `rest` (`[pin, level]`
+//!   resting levels of lines it holds), `i2c` (its address on I2C0), `spi` (true: the bytes on its
+//!   `sck`/`mosi` pins) and `pwm` (pins whose PWM the page should see).
 use std::sync::{Arc, Mutex};
 
 use esp_periph::i2c::I2cDevice;
 
 use crate::board::{BoardEdge, BoardModel, SpiPins, VirtualCycle};
+use crate::js_parts::{self, Drive, JsI2c};
 use crate::devices::sensors::{self, SensorValues};
 use crate::devices::{DcsPanel, Dht, DhtKind, Hx711, Ssd1306, Ssd1306I2c, Ws2812Chain};
 use crate::json::{parse_json, Json};
@@ -101,6 +106,56 @@ impl Tft {
     }
 }
 
+/// A part the host models (see `crate::js_parts`).
+struct JsPart {
+    /// The part's index in the config: how the host knows it.
+    index: u32,
+    kind: String,
+    /// Pins it hears, with the drive state last reported.
+    listens: Vec<(u8, Drive)>,
+    rest: Vec<(u8, bool)>,
+    i2c: Option<u8>,
+    spi: bool,
+    sck: Option<u8>,
+    mosi: Option<u8>,
+    pwm: Vec<u8>,
+}
+
+impl JsPart {
+    fn new(index: usize, kind: &str, p: &Json, js: &Json) -> Self {
+        let pins = |key: &str| -> Vec<u8> {
+            js.get(key).and_then(Json::as_arr).unwrap_or(&[]).iter()
+                .filter_map(Json::as_i64).filter(|n| (0..=48).contains(n)).map(|n| n as u8).collect()
+        };
+        let rest = js.get("rest").and_then(Json::as_arr).unwrap_or(&[]).iter().filter_map(|r| {
+            let r = r.as_arr()?;
+            let pin = r.first()?.as_i64().filter(|n| (0..=48).contains(n))? as u8;
+            let level = match r.get(1)? { Json::Bool(b) => *b, j => j.as_i64()? != 0 };
+            Some((pin, level))
+        }).collect();
+        JsPart {
+            index: index as u32,
+            kind: kind.to_string(),
+            listens: pins("listens").into_iter().map(|p| (p, Drive::Z)).collect(),
+            rest,
+            i2c: js.get("i2c").and_then(Json::as_i64).filter(|a| (1..=0x7f).contains(a)).map(|a| a as u8),
+            spi: matches!(js.get("spi"), Some(Json::Bool(true))),
+            sck: pin(p, "sck"),
+            mosi: pin(p, "mosi"),
+            pwm: pins("pwm"),
+        }
+    }
+    fn on_wires(&self, pins: &SpiPins) -> bool {
+        let (Some(sck), Some(mosi)) = (self.sck, self.mosi) else { return true };
+        let routed = pins.sclk != 0 || pins.mosi != 0;
+        !routed || (pins.sclk >> sck & 1 == 1 && pins.mosi >> mosi & 1 == 1)
+    }
+}
+
+fn drive_of(pin: u8, enabled: u64, output: u64) -> Drive {
+    if enabled >> pin & 1 == 0 { Drive::Z } else if output >> pin & 1 == 1 { Drive::High } else { Drive::Low }
+}
+
 enum Part {
     Oled { addr: u8, state: Arc<Mutex<Ssd1306>> },
     /// An I2C sensor (devices::sensors) whose readings the page sets.
@@ -113,6 +168,7 @@ enum Part {
     Buzzer { pin: u8, rises: [VirtualCycle; 2] },
     Button { pin: u8 },
     Analog { pin: u8 },
+    Js(Box<JsPart>),
 }
 
 /// The most LEDs a strip part may have.
@@ -126,6 +182,10 @@ pub struct VibeBoard {
     gpio_events: u64,
     /// Board-time cycles per second: the SoC bus clock edges and deadlines are counted in.
     cycle_hz: u64,
+    /// Edges and releases the host's parts put on their lines, due and not yet delivered.
+    js_edges: Vec<BoardEdge>,
+    js_released: Vec<u8>,
+    has_js: bool,
 }
 
 fn pin(p: &Json, role: &str) -> Option<u8> {
@@ -142,6 +202,10 @@ impl VibeBoard {
         let mut parts = Vec::new();
         for (i, p) in list.iter().enumerate() {
             let kind = p.str_or("kind", "");
+            if let Some(js) = p.get("js").filter(|j| matches!(j, Json::Obj(_))) {
+                parts.push((i.to_string(), Part::Js(Box::new(JsPart::new(i, kind, p, js)))));
+                continue;
+            }
             let part = match kind {
                 "ssd1306" => {
                     let addr = p.i64_or("addr", 0x3c) as u8;
@@ -183,7 +247,8 @@ impl VibeBoard {
             };
             if let Some(part) = part { parts.push((i.to_string(), part)); }
         }
-        Ok(Self { parts, levels: 0, now: 0, gpio_events: 0, cycle_hz })
+        let has_js = parts.iter().any(|(_, p)| matches!(p, Part::Js(_)));
+        Ok(Self { parts, levels: 0, now: 0, gpio_events: 0, cycle_hz, js_edges: Vec::new(), js_released: Vec::new(), has_js })
     }
 
     /// The board's display: its first OLED or TFT, in the design's order.
@@ -208,6 +273,21 @@ impl VibeBoard {
     }
 
     fn level(&self, pin: u8) -> bool { self.levels >> pin & 1 == 1 }
+
+    fn js_parts(&self) -> impl Iterator<Item = &JsPart> {
+        self.parts.iter().filter_map(|(_, p)| match p { Part::Js(j) => Some(&**j), _ => None })
+    }
+
+    /// Takes the host's edges due by `cycle` into the board's queues.
+    fn pull_js_edges(&mut self, cycle: VirtualCycle) {
+        if !self.has_js { return; }
+        while let Some(e) = js_parts::with_host(None, |h| h.pop_edge(cycle)) {
+            match e.level {
+                Some(level) => self.js_edges.push(BoardEdge { cycle: e.cycle, pin: e.pin, level }),
+                None => self.js_released.push(e.pin),
+            }
+        }
+    }
 }
 
 impl BoardModel for VibeBoard {
@@ -226,6 +306,19 @@ impl BoardModel for VibeBoard {
             }
         }
         for d in self.dhts() { d.host_drive(cycle, enabled, output); }
+        if self.has_js {
+            for (_, p) in self.parts.iter_mut() {
+                let Part::Js(j) = p else { continue };
+                for (pin, last) in j.listens.iter_mut() {
+                    let now = drive_of(*pin, enabled, output);
+                    if now != *last {
+                        *last = now;
+                        let (index, pin) = (j.index, *pin);
+                        js_parts::with_host((), |h| h.pad(index, pin, now, cycle));
+                    }
+                }
+            }
+        }
         for h in self.hx711s() {
             if changes.iter().any(|&(p, _)| p == h.sck) { h.host_drive(cycle, enabled, output); }
         }
@@ -252,12 +345,20 @@ impl BoardModel for VibeBoard {
         }
     }
 
-    fn uses_spi_pins(&self) -> bool { self.parts.iter().any(|(_, p)| matches!(p, Part::Tft(_))) }
+    fn uses_spi_pins(&self) -> bool { self.parts.iter().any(|(_, p)| matches!(p, Part::Tft(_)) || matches!(p, Part::Js(j) if j.spi)) }
 
     fn spi_transfer_pins(&mut self, _host: u8, pins: SpiPins, tx: &[u8], rx_len: usize) -> Vec<u8> {
         for t in self.tfts() {
             if !t.cs_high && t.on_wires(&pins) {
                 for &b in tx { t.panel.byte(b); }
+            }
+        }
+        if self.has_js && !tx.is_empty() {
+            for j in self.js_parts() {
+                if j.spi && j.on_wires(&pins) {
+                    let index = j.index;
+                    js_parts::with_host((), |h| h.spi(index, tx));
+                }
             }
         }
         vec![0xff; rx_len] // no MISO on these modules
@@ -267,6 +368,7 @@ impl BoardModel for VibeBoard {
         self.parts.iter().filter_map(|(_, p)| match p {
             Part::Oled { addr, state } => Some((0u8, *addr, Box::new(Ssd1306I2c::new(state.clone())) as Box<dyn I2cDevice>)),
             Part::Sensor { kind, addr, values } => sensors::make(kind, values.clone()).map(|d| (0u8, *addr, d)),
+            Part::Js(j) => j.i2c.map(|addr| (0u8, addr, Box::new(JsI2c { part: j.index }) as Box<dyn I2cDevice>)),
             _ => None,
         }).collect()
     }
@@ -296,12 +398,14 @@ impl BoardModel for VibeBoard {
     /// Buttons idle high (pressed pulls them low); the DHT line idles high on its pull-up; an
     /// HX711 drives DOUT itself.
     fn input_levels(&self) -> Vec<(u8, bool)> {
-        self.parts.iter().filter_map(|(_, p)| match p {
+        let mut levels: Vec<(u8, bool)> = self.parts.iter().filter_map(|(_, p)| match p {
             Part::Button { pin } => Some((*pin, true)),
             Part::Dht(d) => Some((d.pin, true)),
             Part::Hx711(h) => Some((h.dout, h.dout_level())),
             _ => None,
-        }).collect()
+        }).collect();
+        for j in self.js_parts() { levels.extend(j.rest.iter().copied()); }
+        levels
     }
 
     fn next_deadline(&self) -> Option<VirtualCycle> {
@@ -310,7 +414,7 @@ impl BoardModel for VibeBoard {
             Part::Hx711(h) => h.next_deadline(),
             Part::Strip { chain, .. } => chain.gpio_deadline(),
             _ => None,
-        }).min()
+        }).chain(if self.has_js { js_parts::with_host(None, |h| h.next_edge()) } else { None }).min()
     }
 
     fn advance_to(&mut self, cycle: VirtualCycle) {
@@ -318,16 +422,22 @@ impl BoardModel for VibeBoard {
         for d in self.dhts() { d.advance_to(cycle); }
         for h in self.hx711s() { h.advance_to(cycle); }
         for (_, chain) in self.strips() { chain.advance_gpio(cycle); }
+        self.pull_js_edges(cycle);
     }
 
     fn take_edges(&mut self) -> Vec<BoardEdge> {
         let mut edges: Vec<BoardEdge> = self.dhts().flat_map(|d| d.take_edges()).collect();
         edges.extend(self.hx711s().flat_map(|h| h.take_edges()));
+        edges.append(&mut self.js_edges);
         edges.sort_by_key(|e| e.cycle);
         edges
     }
 
-    fn released_inputs(&mut self) -> Vec<u8> { self.dhts().flat_map(|d| d.take_released()).collect() }
+    fn released_inputs(&mut self) -> Vec<u8> {
+        let mut pins: Vec<u8> = self.dhts().flat_map(|d| d.take_released()).collect();
+        pins.append(&mut self.js_released);
+        pins
+    }
 
     fn named_pin(&self, name: &str) -> Option<u8> {
         let i: usize = name.parse().ok()?;
@@ -336,12 +446,14 @@ impl BoardModel for VibeBoard {
             Part::Dht(d) => Some(d.pin),
             Part::Hx711(h) => Some(h.dout),
             Part::Strip { pin, .. } => Some(*pin),
-            Part::Oled { .. } | Part::Tft(_) | Part::Sensor { .. } => None,
+            Part::Oled { .. } | Part::Tft(_) | Part::Sensor { .. } | Part::Js(_) => None,
         })
     }
 
     fn ui_pwm_pins(&self) -> Vec<u8> {
-        self.parts.iter().filter_map(|(_, p)| match p { Part::Led { pin } | Part::Buzzer { pin, .. } => Some(*pin), _ => None }).collect()
+        let mut pins: Vec<u8> = self.parts.iter().filter_map(|(_, p)| match p { Part::Led { pin } | Part::Buzzer { pin, .. } => Some(*pin), _ => None }).collect();
+        for j in self.js_parts() { pins.extend(j.pwm.iter().copied()); }
+        pins
     }
 
     fn ui_state(&mut self, pwm: &[(u8, Option<(f64, u32)>)]) -> Option<String> {
@@ -388,6 +500,15 @@ impl BoardModel for VibeBoard {
                 }
                 Part::Button { pin } => format!("{{\"id\":\"{id}\",\"kind\":\"button\",\"pin\":{pin}}}"),
                 Part::Analog { pin } => format!("{{\"id\":\"{id}\",\"kind\":\"analog\",\"pin\":{pin}}}"),
+                // the host adds the model's own state; the board knows the pins' levels and PWM
+                Part::Js(j) => {
+                    let mut pins: Vec<u8> = j.listens.iter().map(|(p, _)| *p).chain(j.pwm.iter().copied()).collect();
+                    pins.sort_unstable();
+                    pins.dedup();
+                    let pins: Vec<String> = pins.iter().map(|&p| format!("\"{p}\":{{\"on\":{},\"pwm\":{}}}", self.level(p), fmt_pwm(pwm_of(p)))).collect();
+                    let kind: String = j.kind.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+                    format!("{{\"id\":\"{id}\",\"kind\":\"{kind}\",\"js\":true,\"pins\":{{{}}}}}", pins.join(","))
+                }
             });
         }
         Some(format!("\"parts\":[{}]", items.join(",")))
@@ -510,6 +631,70 @@ mod tests {
         assert_eq!(bits, vec![None, None, None, None, None, None, Some(true)]);
         let s = b.ui_state(&[]).unwrap();
         assert!(s.contains(r#""kind":"hx711","pin":4,"sck":5,"weight":500.0,"capacity":5000,"sensitivity":1.000,"offset":-1000,"gain":128,"raw":213748"#), "{s}");
+    }
+
+    #[test]
+    fn js_parts_hear_their_pads_answer_on_i2c_spi_and_put_edges_on_their_lines() {
+        use crate::js_parts::{set_host, test_host::{Log, TestHost, SERIAL}, Drive, JsEdge};
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let log = Arc::new(Mutex::new(Log::default()));
+        set_host(Some(Box::new(TestHost(log.clone()))));
+        let cfg = r#"{"parts":[
+            {"kind":"led","pins":{"signal":2}},
+            {"kind":"hcsr04","pins":{"trig":5,"echo":18},"js":{"listens":[5],"rest":[[18,false]]}},
+            {"kind":"lcd1602","pins":{"sda":8,"scl":9},"js":{"i2c":39}},
+            {"kind":"epaper","pins":{"sck":12,"mosi":11,"cs":10,"dc":9,"busy":4},"js":{"listens":[10,9],"spi":true,"rest":[[4,false]]}},
+            {"kind":"servo","pins":{"signal":13},"js":{"pwm":[13]}}
+        ]}"#;
+        let mut b = VibeBoard::from_config(cfg, HZ).unwrap();
+        assert_eq!(b.parts.len(), 5);
+        assert!(b.uses_spi_pins());
+        assert_eq!(b.input_levels(), vec![(18, false), (4, false)]);
+        assert_eq!(b.ui_pwm_pins(), vec![2, 13]);
+        // TRIG driven high, then low: two pad events; the LED's pin is not the part's
+        b.gpio_output_at(100, &[(5, true)], 1 << 5, 1 << 5);
+        b.gpio_output_at(200, &[(2, true)], 1 << 5 | 1 << 2, 1 << 5 | 1 << 2);
+        b.gpio_output_at(300, &[(5, false)], 1 << 5 | 1 << 2, 1 << 2);
+        // released to an input: a drive change with no level change
+        b.gpio_output_at(400, &[], 1 << 2, 1 << 2);
+        let pads: Vec<_> = log.lock().unwrap().pads.iter().filter(|p| p.0 == 1).cloned().collect();
+        assert_eq!(pads, vec![(1, 5, Drive::High, 100), (1, 5, Drive::Low, 300), (1, 5, Drive::Z, 400)]);
+        // the host answers with an echo pulse: a deadline, then edges in order
+        log.lock().unwrap().edges = vec![
+            JsEdge { cycle: 2_000, pin: 18, level: Some(true) },
+            JsEdge { cycle: 5_000, pin: 18, level: Some(false) },
+            JsEdge { cycle: 6_000, pin: 4, level: None },
+        ];
+        assert_eq!(b.next_deadline(), Some(2_000));
+        b.advance_to(5_000);
+        assert_eq!(b.take_edges(), vec![BoardEdge { cycle: 2_000, pin: 18, level: true }, BoardEdge { cycle: 5_000, pin: 18, level: false }]);
+        assert_eq!(b.next_deadline(), Some(6_000));
+        b.advance_to(6_000);
+        assert_eq!(b.released_inputs(), vec![4]);
+        assert_eq!(b.next_deadline(), None);
+        // I2C: the LCD's backpack at 0x27
+        let mut devs = b.i2c_devices();
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].1, 0x27);
+        log.lock().unwrap().reads = vec![0x5a];
+        let d = &mut devs[0].2;
+        assert!(d.start(false));
+        assert!(d.write(0x08));
+        d.stop();
+        assert!(d.start(true));
+        assert_eq!(d.read(), 0x5a);
+        assert!(log.lock().unwrap().i2c.contains(&(2, crate::js_parts::i2c_op::WRITE, 0x08)));
+        // SPI bytes reach the panel only on its own wires
+        let on = SpiPins { sclk: 1 << 12, mosi: 1 << 11, miso: None, cs: 0 };
+        let off = SpiPins { sclk: 1 << 14, mosi: 1 << 15, miso: None, cs: 0 };
+        b.spi_transfer_pins(2, on, &[0x24, 0xff], 0);
+        b.spi_transfer_pins(2, off, &[0x01], 0);
+        assert_eq!(log.lock().unwrap().spi, vec![(3, vec![0x24, 0xff])]);
+        // the page sees each part's pins and PWM, and the host adds the rest
+        let s = b.ui_state(&[(13, Some((50.0, 4915)))]).unwrap();
+        assert!(s.contains(r#"{"id":"1","kind":"hcsr04","js":true,"pins":{"5":{"on":false,"pwm":null}}}"#), "{s}");
+        assert!(s.contains(r#"{"id":"4","kind":"servo","js":true,"pins":{"13":{"on":false,"pwm":[50.0,4915]}}}"#), "{s}");
+        set_host(None);
     }
 
     #[test]
